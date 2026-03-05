@@ -1,0 +1,44 @@
+# Build artifacts
+*.o
+*.a
+*.so
+y.output
+
+# Compiled DSGen binaries (rebuilt by `make build`)
+DSGen-software-code-4.0.0/tools/dsdgen
+DSGen-software-code-4.0.0/tools/dsqgen
+DSGen-software-code-4.0.0/tools/checksum
+DSGen-software-code-4.0.0/tools/distcomp
+DSGen-software-code-4.0.0/tools/mkheader
+
+# Generated source files (rebuilt by `make build`)
+DSGen-software-code-4.0.0/tools/columns.h
+DSGen-software-code-4.0.0/tools/streams.h
+DSGen-software-code-4.0.0/tools/tokenizer.c
+DSGen-software-code-4.0.0/tools/tpcds.idx
+DSGen-software-code-4.0.0/tools/tpcds.idx.h
+DSGen-software-code-4.0.0/tools/y.tab.c
+DSGen-software-code-4.0.0/tools/y.tab.h
+
+# Windows/Visual Studio project files
+*.vcproj
+*.sln
+*.rules
+
+# macOS
+.DS_Store
+
+# ctags
+.ctags_updated
+
+# Generated data files
+*.dat
+
+# Benchmark result directories (keep chart tools tracked)
+benchmarks/*/
+
+# Vim swap files
+*.swp
+
+# Python bytecode
+__pycache__/

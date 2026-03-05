@@ -1,0 +1,4 @@
+comment = 'TPC-DS v4 benchmark for Apache Cloudberry'
+default_version = '1.0'
+relocatable = false
+schema = tpcds
