@@ -1,4 +1,4 @@
-# tpcds — TPC-DS Benchmark for Apache Cloudberry / Greenplum
+# cbdb_tpcds — TPC-DS Benchmark for Apache Cloudberry / Greenplum
 
 Run the full [TPC-DS v4](http://www.tpc.org/tpcds/) benchmark inside your MPP cluster — entirely from SQL, with a single command.
 
@@ -15,12 +15,17 @@ This generates data **in parallel across all segments**, loads it via **one gpfd
 ## Quick Start
 
 ```bash
-# Build and install (requires gcc, pg_config on PATH)
+# Clone and install (requires gcc, pg_config on PATH)
+git clone git@github.com:avamingli/cbdb_tpcds.git
+cd cbdb_tpcds
 make && make install
+```
 
-# Connect to any database and run
-psql -p <port> -d <your_db> -c "CREATE EXTENSION tpcds;"
-psql -p <port> -d <your_db> -c "CALL tpcds.run(100, 4, 'aocs');"
+Then in any database:
+
+```sql
+CREATE EXTENSION tpcds;
+CALL tpcds.run(scale := 100, parallel := 4, storage_type := 'aocs');
 ```
 
 ## Why This Extension
@@ -66,6 +71,41 @@ SELECT tpcds.gen_chart();
 ### Example Chart (SF=100, Planner)
 
 ![TPC-DS SF=100 benchmark chart](benchmarks/queries_sf100.png)
+
+## Debugging Individual Queries
+
+Inspect, run, or explain any single query by ID:
+
+```sql
+-- Show the SQL text of query 1
+=# SELECT tpcds.show(1);
+ with customer_total_return as
+ (select sr_customer_sk as ctr_customer_sk
+ ,sr_store_sk as ctr_store_sk
+ ,sum(SR_FEE) as ctr_total_return
+ from store_returns ,date_dim
+ where sr_returned_date_sk = d_date_sk and d_year = 2000
+ group by sr_customer_sk ,sr_store_sk)
+  select c_customer_id
+ from customer_total_return ctr1 ,store ,customer
+ where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2 ...)
+ order by c_customer_id limit 100;
+
+-- Execute a single query and see timing
+=# SELECT tpcds.exec(1);
+ query 1: OK, 1803.91 ms, 100 rows
+
+-- Show the query plan (supports ANALYZE, BUFFERS, etc.)
+=# SELECT tpcds.explain(1);
+ Limit  (cost=7494.00..7495.04 rows=100 width=17)
+   ->  Gather Motion 32:1  (slice1; segments: 32)
+         ->  Limit  (cost=7494.00..7494.20 rows=76 width=17)
+               ->  Sort  (cost=7494.00..7494.20 rows=76 width=17)
+                     ->  Hash Join  (cost=6601.28..7491.62 rows=76 width=17)
+                           ...
+
+=# SELECT tpcds.explain(1, 'ANALYZE, BUFFERS');
+```
 
 ## Example: SF=1 End-to-End
 
