@@ -1709,6 +1709,12 @@ DECLARE
     _tmp_dir      TEXT;
     _host_tmp     TEXT;
     _host_idx     INTEGER;
+    _progress     TEXT;
+    _num_tables   INTEGER;
+    _last_load    INTEGER := 0;
+    _last_analyze INTEGER := 0;
+    _new_count    INTEGER;
+    _stale_polls  INTEGER := 0;
 BEGIN
     -- Resolve workers from config if NULL
     IF workers IS NULL THEN
@@ -1760,6 +1766,8 @@ BEGIN
     _user    := current_user;
     _logfile := _tmp_dir || '/tpcds_load_' || _pid || '.log';
     _errfile := _tmp_dir || '/tpcds_load_' || _pid || '.err';
+    _progress := _tmp_dir || '/tpcds_load_' || _pid || '.progress';
+    _num_tables := array_length(_tables, 1);
     SELECT setting INTO _db_port FROM pg_settings WHERE name = 'port';
     SELECT trim(split_part(setting, ',', 1)) INTO _socket
         FROM pg_settings WHERE name = 'unix_socket_directories';
@@ -1943,7 +1951,8 @@ BEGIN
         'PSQL="' || _psql_base || '"',
         'LOG="' || _logfile || '"',
         'ERR="' || _errfile || '"',
-        'rm -f "$ERR"',
+        'PROGRESS="' || _progress || '"',
+        'rm -f "$ERR" "$PROGRESS"',
         '',
         'run_load() {',
         '    local tbl=$1 t0=$(date +%s)',
@@ -1951,6 +1960,7 @@ BEGIN
         '    local rc=$? e=$(( $(date +%s) - t0 ))',
         '    if [ $rc -ne 0 ]; then echo "$tbl" >> "$ERR"; fi',
         '    echo "  LOAD $tbl ${e}s $([ $rc -eq 0 ] && echo OK || echo FAILED)" | tee -a "$LOG"',
+        '    echo "LOAD $tbl $rc $e" >> "$PROGRESS"',
         '}',
         '',
         'echo "=== TPC-DS load started: workers=' || workers || ', $(date) ===" | tee "$LOG"'
@@ -1964,7 +1974,8 @@ BEGIN
             'ssh -o StrictHostKeyChecking=no %s bash %s/tpcds_%s_gpfdist_%s.sh',
             _host, _host_tmp, _pid, _host)];
     END LOOP;
-    _script := _script || ARRAY['sleep 2', 'echo "gpfdist instances started" | tee -a "$LOG"'];
+    _script := _script || ARRAY['sleep 2', 'echo "gpfdist instances started" | tee -a "$LOG"',
+        'echo "GPFDIST_READY" >> "$PROGRESS"'];
 
     -- Read actual ports from per-segment .port files and substitute into setup SQL
     _script := _script || ARRAY['', '# Read actual gpfdist ports and substitute into setup SQL'];
@@ -1990,7 +2001,8 @@ BEGIN
         '# Setup: TRUNCATE target tables + create external tables (separate connection, no lock conflict)',
         '$PSQL -f "' || _setup_sql || '" >> "$LOG" 2>&1',
         'if [ $? -ne 0 ]; then echo "SETUP FAILED" | tee -a "$LOG"; exit 1; fi',
-        'echo "Setup done (truncated + created external tables)" | tee -a "$LOG"'
+        'echo "Setup done (truncated + created external tables)" | tee -a "$LOG"',
+        'echo "SETUP_DONE" >> "$PROGRESS"'
     ];
 
     FOREACH _tbl IN ARRAY _tables LOOP
@@ -2017,7 +2029,7 @@ BEGIN
     FOREACH _tbl IN ARRAY _tables LOOP
         _script := _script || ARRAY[(
             'while [ $(jobs -r 2>/dev/null | wc -l) -ge $MAX ]; do sleep 0.2; done' ||
-            '; $PSQL -c "ANALYZE tpcds.' || _tbl || ';" >> "$LOG" 2>&1 && echo "  ANALYZE ' || _tbl || ' done" | tee -a "$LOG" &'
+            '; ( $PSQL -c "ANALYZE tpcds.' || _tbl || ';" >> "$LOG" 2>&1; echo "ANALYZE ' || _tbl || '" >> "$PROGRESS" ) &'
         )];
     END LOOP;
 
@@ -2036,8 +2048,11 @@ BEGIN
         '',
         'echo "=== All done: $(date) ===" | tee -a "$LOG"',
         'if [ -f "$ERR" ]; then',
-        '    echo "FAILED:" && cat "$ERR" && exit 1',
+        '    echo "FAILED:" && cat "$ERR"',
+        '    echo "LOAD_ERROR" >> "$PROGRESS"',
+        '    exit 1',
         'fi',
+        'echo "ALL_DONE" >> "$PROGRESS"',
         'exit 0'
     ];
 
@@ -2049,14 +2064,82 @@ BEGIN
     );
 
     RAISE NOTICE 'load_data: launching % parallel workers, log: %', workers, _logfile;
-    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', 'bash ' || _main_sh || ' 2>>' || _logfile);
+
+    -- Launch load script in background so we can poll for progress
+    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
+        format('bash -c ''nohup bash %s >>%s 2>&1 </dev/null &''', _main_sh, _logfile));
+
+    -- Poll progress file for load/analyze completion
+    SET LOCAL client_min_messages = warning;
+    CREATE TEMP TABLE IF NOT EXISTS _load_prog (line TEXT) ON COMMIT DROP DISTRIBUTED RANDOMLY;
+    RESET client_min_messages;
+
+    LOOP
+        PERFORM pg_sleep(3);
+
+        TRUNCATE _load_prog;
+        BEGIN
+            EXECUTE format('COPY _load_prog FROM PROGRAM %L',
+                format('cat %s 2>/dev/null || true', _progress));
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END;
+
+        -- Report phase transitions
+        IF _last_load = 0 AND _last_analyze = 0 THEN
+            IF EXISTS (SELECT 1 FROM _load_prog WHERE line = 'GPFDIST_READY') AND _stale_polls > 0 THEN
+                RAISE NOTICE 'load_data: gpfdist started, preparing tables...';
+            END IF;
+            IF EXISTS (SELECT 1 FROM _load_prog WHERE line = 'SETUP_DONE') THEN
+                RAISE NOTICE 'load_data: setup done, loading data...';
+            END IF;
+        END IF;
+
+        -- Track load progress
+        SELECT count(*) INTO _new_count FROM _load_prog WHERE line LIKE 'LOAD %';
+        IF _new_count > _last_load THEN
+            _stale_polls := 0;
+            RAISE NOTICE 'load_data: [%/%] tables loaded  (% sec)',
+                _new_count, _num_tables,
+                round(extract(epoch from clock_timestamp() - _start_ts)::numeric, 0);
+            _last_load := _new_count;
+        END IF;
+
+        -- Track ANALYZE progress
+        SELECT count(*) INTO _new_count FROM _load_prog WHERE line LIKE 'ANALYZE %';
+        IF _new_count > _last_analyze THEN
+            _stale_polls := 0;
+            RAISE NOTICE 'load_data: ANALYZE [%/%]  (% sec)',
+                _new_count, _num_tables,
+                round(extract(epoch from clock_timestamp() - _start_ts)::numeric, 0);
+            _last_analyze := _new_count;
+        END IF;
+
+        -- Check completion or error
+        IF EXISTS (SELECT 1 FROM _load_prog WHERE line = 'ALL_DONE') THEN
+            EXIT;
+        END IF;
+        IF EXISTS (SELECT 1 FROM _load_prog WHERE line = 'LOAD_ERROR') THEN
+            RAISE EXCEPTION 'load_data: some tables failed to load. Check log: %', _logfile;
+        END IF;
+
+        -- Stale progress detection (30 min timeout)
+        _stale_polls := _stale_polls + 1;
+        IF _stale_polls > 600 THEN
+            RAISE EXCEPTION 'load_data: no progress for 30 minutes. Check log: %', _logfile;
+        END IF;
+    END LOOP;
+
+    SET LOCAL client_min_messages = warning;
+    DROP TABLE IF EXISTS _load_prog;
+    RESET client_min_messages;
 
     -- =====================================================================
     -- Phase 4: Clean up temp files (gpfdist already stopped by shell script)
     -- =====================================================================
     BEGIN
         EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
-            'rm -f ' || _main_sh || ' ' || _setup_sql || ' ' || _tmp_dir || '/tpcds_' || _pid || '_gpfdist_*.sh');
+            'rm -f ' || _main_sh || ' ' || _setup_sql || ' ' ||
+            _tmp_dir || '/tpcds_' || _pid || '_gpfdist_*.sh ' || _progress);
     EXCEPTION WHEN OTHERS THEN NULL;
     END;
 
