@@ -63,6 +63,10 @@ SELECT * FROM tpcds.bench_summary ORDER BY query_id;
 SELECT tpcds.gen_chart();
 ```
 
+### Example Chart (SF=100, Planner)
+
+![TPC-DS SF=100 benchmark chart](benchmarks/queries_sf100.png)
+
 ## Example: SF=1 End-to-End
 
 ```

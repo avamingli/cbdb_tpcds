@@ -135,7 +135,7 @@ def write_summary_csv(run_dir, rows):
 def create_chart(run_dir, rows, sf, date_str):
     """Generate queries.png — vertical bar chart of per-query duration."""
     query_ids = [r["query_id"] for r in rows]
-    durations = [float(r["duration_ms"]) for r in rows]
+    durations = [float(r["duration_ms"]) / 1000 for r in rows]  # seconds
     statuses  = [r["status"] for r in rows]
 
     colors = ["#4CAF50" if s == "OK" else "#F44336" for s in statuses]
@@ -143,24 +143,15 @@ def create_chart(run_dir, rows, sf, date_str):
     fig_w = max(14, len(query_ids) * 0.18)
     fig, ax = plt.subplots(figsize=(fig_w, 6))
 
-    # Detect outliers: if max > 3x the 95th percentile, clip Y axis
-    sorted_d = sorted(durations)
-    p95 = sorted_d[int(len(sorted_d) * 0.95)] if len(sorted_d) >= 5 else max(sorted_d)
-    y_cap = None
-    if max(durations) > 3 * p95 and p95 > 0:
-        y_cap = p95 * 2.0
-
     bars = ax.bar(range(len(query_ids)), durations, color=colors, edgecolor="none", width=0.8)
 
-    # Annotate clipped bars with their actual value
-    if y_cap:
-        ax.set_ylim(0, y_cap * 1.12)
-        for i, (d, bar) in enumerate(zip(durations, bars)):
-            if d > y_cap:
-                bar.set_height(y_cap * 1.05)
-                label = f"{d/1000:.0f}s" if d >= 1000 else f"{d:.0f}"
-                ax.text(i, y_cap * 1.07, label, ha="center", va="bottom",
-                        fontsize=6, fontweight="bold", color="#B71C1C")
+    # Annotate the top 3 slowest queries with their time
+    top_n = sorted(range(len(durations)), key=lambda i: durations[i], reverse=True)[:3]
+    for i in top_n:
+        d = durations[i]
+        label = f"{d:.0f}s" if d >= 1 else f"{d*1000:.0f}ms"
+        ax.text(i, d, label, ha="center", va="bottom",
+                fontsize=6, fontweight="bold", color="#B71C1C")
 
     # X axis
     ax.set_xticks(range(len(query_ids)))
@@ -168,11 +159,11 @@ def create_chart(run_dir, rows, sf, date_str):
     ax.set_xlabel("Query ID")
 
     # Y axis
-    ax.set_ylabel("Duration (ms)")
+    ax.set_ylabel("Duration (s)")
 
     # Title
-    total_ms = sum(durations)
-    total_str = f"{total_ms/1000:.1f}s" if total_ms >= 60000 else f"{total_ms:.0f}ms"
+    total_s = sum(durations)
+    total_str = f"{total_s:.1f}s"
     ok_count  = sum(1 for s in statuses if s == "OK")
     err_count = len(statuses) - ok_count
 
