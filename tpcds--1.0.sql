@@ -2258,7 +2258,12 @@ DECLARE
 BEGIN
     SELECT query_text INTO _sql FROM tpcds.query WHERE query_id = qid;
     IF _sql IS NULL THEN
-        RAISE EXCEPTION 'Query % not found (valid: 1-99)', qid;
+        IF NOT EXISTS (SELECT 1 FROM tpcds.query LIMIT 1) THEN
+            RAISE EXCEPTION 'No queries loaded. Run SELECT tpcds.gen_query() first.';
+        END IF;
+        RAISE EXCEPTION 'Query % not found (valid: %-%)', qid,
+            (SELECT min(query_id) FROM tpcds.query),
+            (SELECT max(query_id) FROM tpcds.query);
     END IF;
     RETURN _sql;
 END;
@@ -2285,7 +2290,12 @@ DECLARE
 BEGIN
     SELECT query_text INTO _sql FROM tpcds.query WHERE query_id = qid;
     IF _sql IS NULL THEN
-        RAISE EXCEPTION 'Query % not found (valid: 1-99)', qid;
+        IF NOT EXISTS (SELECT 1 FROM tpcds.query LIMIT 1) THEN
+            RAISE EXCEPTION 'No queries loaded. Run SELECT tpcds.gen_query() first.';
+        END IF;
+        RAISE EXCEPTION 'Query % not found (valid: %-%)', qid,
+            (SELECT min(query_id) FROM tpcds.query),
+            (SELECT max(query_id) FROM tpcds.query);
     END IF;
 
     _saved_path := current_setting('search_path');
@@ -2345,7 +2355,12 @@ DECLARE
 BEGIN
     SELECT query_text INTO _sql FROM tpcds.query WHERE query_id = qid;
     IF _sql IS NULL THEN
-        RAISE EXCEPTION 'Query % not found (valid: 1-99)', qid;
+        IF NOT EXISTS (SELECT 1 FROM tpcds.query LIMIT 1) THEN
+            RAISE EXCEPTION 'No queries loaded. Run SELECT tpcds.gen_query() first.';
+        END IF;
+        RAISE EXCEPTION 'Query % not found (valid: %-%)', qid,
+            (SELECT min(query_id) FROM tpcds.query),
+            (SELECT max(query_id) FROM tpcds.query);
     END IF;
 
     _saved_path := current_setting('search_path');

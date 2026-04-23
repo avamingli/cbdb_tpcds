@@ -28,6 +28,55 @@ CREATE EXTENSION tpcds;
 CALL tpcds.run(scale := 100, parallel := 4, storage_type := 'aocs');
 ```
 
+## Recommended Configuration
+
+Before running benchmarks, tune your cluster for maximum OLAP performance.
+
+### Hardware Sizing
+
+| Scale Factor | Raw Data | Min RAM | Recommended Segments | Bench Time (ref) |
+|---|---|---|---|---|
+| 1 (1 GB) | ~1 GB | 8 GB | 4 | ~30s |
+| 100 (100 GB) | ~10 GB | 64 GB | 8–16 | ~11 min |
+| 1000 (1 TB) | ~100 GB | 256 GB | 32 | ~92 min |
+
+*Bench times measured on a single node (96 CPUs, 370 GB RAM, 32 segments, Planner).*
+
+### Database Parameters
+
+**Memory parameters** (scale based on your RAM and segment count):
+
+| Parameter | Formula | Example (256 GB, 32 segs) |
+|---|---|---|
+| `statement_mem` | `(RAM - 8GB) / segs × 2 × 80%` | **15 GB** |
+| `gp_vmem_protect_limit` | `(RAM - 8GB) / segs × 2 × 1024` MB | **15872 MB** |
+| `work_mem` | `min(1GB, RAM × 10% / segs)` | **800 MB** |
+| `shared_buffers` | Fixed | **128 MB** |
+
+> `statement_mem` is the most performance-sensitive parameter. Halving it from 15 GB to 8 GB caused a 9% slowdown at SF=1000.
+> `shared_buffers` has negligible impact on OLAP workloads (128 MB vs 256 MB showed no difference).
+
+**Fixed parameters** (best practice, independent of hardware):
+
+```bash
+# Optimizer
+gpconfig -c optimizer -v off                    # Planner is 77% faster than ORCA for TPC-DS
+gpconfig -c enable_groupagg -v off
+gpconfig -c gp_eager_two_phase_agg -v off
+gpconfig -c gp_enable_agg_pushdown -v off
+
+# Execution
+gpconfig -c gp_cte_sharing -v on
+gpconfig -c enable_parallel -v on
+gpconfig -c gp_workfile_compression -v on
+gpconfig -c gp_interconnect_queue_depth -v 16
+gpconfig -c gp_interconnect_snd_queue_depth -v 16
+gpconfig -c gp_resqueue_memory_policy -v eager_free
+gpconfig -c autovacuum -v off
+```
+
+After changing parameters, restart the cluster: `gpstop -ra`
+
 ## Why This Extension
 
 Traditional TPC-DS benchmarking on MPP databases requires juggling shell scripts, SSH, gpfdist setup, and manual query patching. This extension handles it all:
@@ -196,7 +245,7 @@ Note: `DROP EXTENSION tpcds CASCADE` removes extension functions and internal ta
 | `tpcds.exec(qid)` | Execute a single query and return timing |
 | `tpcds.explain(qid, opts)` | Show query plan (e.g. `'ANALYZE, BUFFERS'`) |
 
-### Configuration & Maintenance
+### Configuration
 
 | Function | Description |
 |---|---|
