@@ -2273,19 +2273,17 @@ $func$;
 -- exec(qid) — execute a single query, record results
 -- =============================================================================
 CREATE OR REPLACE FUNCTION tpcds.exec(qid INTEGER)
-RETURNS TEXT
+RETURNS SETOF TEXT
 LANGUAGE plpgsql
 AS $func$
 DECLARE
     _sql TEXT;
     _stmts TEXT[];
     _stmt TEXT;
-    _start_ts TIMESTAMPTZ;
-    _dur NUMERIC;
-    _rows BIGINT;
-    _total_dur NUMERIC := 0;
-    _total_rows BIGINT := 0;
-    _status TEXT := 'OK';
+    _part INTEGER := 0;
+    _num_stmts INTEGER;
+    _rec RECORD;
+    _row_num BIGINT;
     _saved_path TEXT;
 BEGIN
     SELECT query_text INTO _sql FROM tpcds.query WHERE query_id = qid;
@@ -2305,34 +2303,35 @@ BEGIN
     _sql := rtrim(_sql, ';');
     _stmts := string_to_array(_sql, ';');
 
+    SELECT count(*) INTO _num_stmts
+    FROM unnest(_stmts) s WHERE btrim(s, E' \t\n\r') <> '';
+
     FOREACH _stmt IN ARRAY _stmts LOOP
         _stmt := btrim(_stmt, E' \t\n\r');
         IF _stmt = '' OR _stmt IS NULL THEN
             CONTINUE;
         END IF;
+        _part := _part + 1;
 
-        BEGIN
-            _start_ts := clock_timestamp();
-            EXECUTE _stmt;
-            GET DIAGNOSTICS _rows = ROW_COUNT;
-            _dur := extract(epoch from clock_timestamp() - _start_ts) * 1000;
-            _total_dur := _total_dur + _dur;
-            _total_rows := _total_rows + _rows;
-        EXCEPTION WHEN OTHERS THEN
-            _status := 'ERROR: ' || SQLERRM;
-            _dur := extract(epoch from clock_timestamp() - _start_ts) * 1000;
-            _total_dur := _total_dur + _dur;
-        END;
+        IF _num_stmts > 1 THEN
+            RETURN NEXT format('-- Statement %s of %s', _part, _num_stmts);
+        END IF;
+
+        -- Use CREATE TEMP TABLE AS to preserve parallel execution plans.
+        -- PL/pgSQL cursors disable parallel, but CTAS runs the full plan.
+        EXECUTE 'DROP TABLE IF EXISTS pg_temp._tpcds_exec_tmp';
+        EXECUTE 'CREATE TEMP TABLE _tpcds_exec_tmp AS ' || _stmt;
+        GET DIAGNOSTICS _row_num = ROW_COUNT;
+
+        FOR _rec IN SELECT row_to_json(t)::TEXT AS line FROM pg_temp._tpcds_exec_tmp t LOOP
+            RETURN NEXT _rec.line;
+        END LOOP;
+        EXECUTE 'DROP TABLE pg_temp._tpcds_exec_tmp';
+
+        RETURN NEXT format('-- (%s rows)', _row_num);
     END LOOP;
 
     PERFORM set_config('search_path', _saved_path, false);
-
-    INSERT INTO tpcds.bench_results (query_id, status, duration_ms, rows_returned, scale_factor, storage_type)
-    VALUES (qid, _status, round(_total_dur, 2), _total_rows,
-            (SELECT NULLIF(value, '')::INTEGER FROM tpcds.config WHERE key = 'scale_factor'),
-            (SELECT NULLIF(value, '') FROM tpcds.config WHERE key = 'storage_type'));
-
-    RETURN format('query %s: %s, %s ms, %s rows', qid, _status, round(_total_dur, 2), _total_rows);
 END;
 $func$;
 
