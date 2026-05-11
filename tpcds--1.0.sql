@@ -2408,9 +2408,9 @@ $func$;
 --   skip: array of query_ids to skip
 -- =============================================================================
 CREATE OR REPLACE FUNCTION tpcds.bench(
-    optimizer TEXT DEFAULT NULL,
     timeout_sec INTEGER DEFAULT NULL,
-    skip INTEGER[] DEFAULT NULL
+    skip INTEGER[] DEFAULT NULL,
+    explain_analyze BOOLEAN DEFAULT false
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -2427,6 +2427,8 @@ DECLARE
     _total_rows BIGINT;
     _status TEXT;
     _all_lines TEXT;
+    _plan_lines TEXT;
+    _plan_rec RECORD;
     _part INTEGER;
     _num_stmts INTEGER;
     _results_dir TEXT;
@@ -2441,38 +2443,24 @@ DECLARE
     _storage_type TEXT;
     _saved_path TEXT;
     _optimizer_label TEXT;
-    _saved_optimizer TEXT;
 BEGIN
     _bench_start := now();
     _saved_path := current_setting('search_path');
     PERFORM set_config('search_path', 'tpcds, public', false);
 
-    -- Resolve from config if NULL
-    IF optimizer IS NULL THEN
-        SELECT NULLIF(value, '') INTO optimizer FROM tpcds.config WHERE key = 'optimizer';
-    END IF;
-    IF timeout_sec IS NULL THEN
-        SELECT NULLIF(value, '')::INTEGER INTO timeout_sec FROM tpcds.config WHERE key = 'timeout_sec';
-    END IF;
-
     -- Read scale_factor and storage_type for result metadata
     SELECT NULLIF(value, '')::INTEGER INTO _scale_factor FROM tpcds.config WHERE key = 'scale_factor';
     SELECT NULLIF(value, '') INTO _storage_type FROM tpcds.config WHERE key = 'storage_type';
 
-    -- Set optimizer if requested
-    IF optimizer IS NOT NULL THEN
-        IF lower(optimizer) IN ('on', 'off') THEN
-            _saved_optimizer := current_setting('optimizer', true);
-            PERFORM set_config('optimizer', lower(optimizer), false);
-            _optimizer_label := CASE WHEN lower(optimizer) = 'on' THEN 'ORCA' ELSE 'Planner' END;
-            RAISE NOTICE 'bench: using optimizer=% (%)', optimizer, _optimizer_label;
-        ELSE
-            RAISE EXCEPTION 'optimizer must be ''on'' (ORCA), ''off'' (Planner), or NULL (inherit)';
-        END IF;
-    ELSE
-        _optimizer_label := CASE WHEN current_setting('optimizer', true) = 'on' THEN 'ORCA' ELSE 'Planner' END;
-    END IF;
+    -- Detect optimizer label from current session setting (no GUC changes)
+    _optimizer_label := CASE WHEN current_setting('optimizer', true) = 'on' THEN 'ORCA' ELSE 'Planner' END;
+    RAISE NOTICE 'bench: optimizer=% (%), enable_parallel=%',
+        current_setting('optimizer', true), _optimizer_label,
+        current_setting('enable_parallel', true);
 
+    IF explain_analyze THEN
+        RAISE NOTICE 'bench: EXPLAIN ANALYZE mode enabled (plans saved to result files)';
+    END IF;
     IF timeout_sec IS NOT NULL THEN
         RAISE NOTICE 'bench: per-query timeout: %s', timeout_sec;
     END IF;
@@ -2528,14 +2516,24 @@ BEGIN
 
             BEGIN
                 _start_ts := clock_timestamp();
-                EXECUTE _stmt;
-                GET DIAGNOSTICS _rows = ROW_COUNT;
-                _dur := extract(epoch from clock_timestamp() - _start_ts) * 1000;
-                _total_dur := _total_dur + _dur;
-                _total_rows := _total_rows + _rows;
-                _all_lines := _all_lines
-                    || format('Statement %s: %s rows, %s ms',
-                              _part, _rows, round(_dur, 2)) || E'\n';
+                IF explain_analyze THEN
+                    _plan_lines := '';
+                    FOR _plan_rec IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS ON) ' || _stmt LOOP
+                        _plan_lines := _plan_lines || _plan_rec."QUERY PLAN" || E'\n';
+                    END LOOP;
+                    _dur := extract(epoch from clock_timestamp() - _start_ts) * 1000;
+                    _total_dur := _total_dur + _dur;
+                    _all_lines := _all_lines || _plan_lines;
+                ELSE
+                    EXECUTE _stmt;
+                    GET DIAGNOSTICS _rows = ROW_COUNT;
+                    _dur := extract(epoch from clock_timestamp() - _start_ts) * 1000;
+                    _total_dur := _total_dur + _dur;
+                    _total_rows := _total_rows + _rows;
+                    _all_lines := _all_lines
+                        || format('Statement %s: %s rows, %s ms',
+                                  _part, _rows, round(_dur, 2)) || E'\n';
+                END IF;
             EXCEPTION
                 WHEN query_canceled THEN
                     _status := format('TIMEOUT (%ss)', timeout_sec);
@@ -2558,11 +2556,10 @@ BEGIN
         INSERT INTO tpcds.bench_results (query_id, status, duration_ms, rows_returned, optimizer, scale_factor, storage_type)
         VALUES (_qid, _status, round(_total_dur, 2), _total_rows, _optimizer_label, _scale_factor, _storage_type);
 
-        _filename := format('query%s.out', _qid);
+        _filename := format('%s/query%s.out', _results_dir, _qid);
         BEGIN
-            EXECUTE format('COPY (SELECT %L) TO PROGRAM %L',
-                _all_lines,
-                format('cat > %s/%s', _results_dir, _filename));
+            EXECUTE format('COPY (SELECT unnest(string_to_array(%L, E''\n''))) TO %L',
+                _all_lines, _filename);
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'Could not write %: %', _filename, SQLERRM;
         END;
@@ -2579,11 +2576,6 @@ BEGIN
             _qid, _qid, _status, round(_total_dur),
             round(extract(epoch from clock_timestamp() - _bench_start)::numeric, 1);
     END LOOP;
-
-    -- Restore optimizer setting
-    IF optimizer IS NOT NULL AND _saved_optimizer IS NOT NULL THEN
-        PERFORM set_config('optimizer', _saved_optimizer, false);
-    END IF;
 
     -- Update bench_summary table with latest run
     TRUNCATE tpcds.bench_summary;
