@@ -2319,14 +2319,17 @@ BEGIN
 
         -- Use CREATE TEMP TABLE AS to preserve parallel execution plans.
         -- PL/pgSQL cursors disable parallel, but CTAS runs the full plan.
-        EXECUTE 'DROP TABLE IF EXISTS pg_temp._tpcds_exec_tmp';
+        -- Suppress "schema pg_temp does not exist" notices on segments.
+        PERFORM set_config('client_min_messages', 'warning', false);
+        EXECUTE 'DROP TABLE IF EXISTS _tpcds_exec_tmp';
+        PERFORM set_config('client_min_messages', 'notice', false);
         EXECUTE 'CREATE TEMP TABLE _tpcds_exec_tmp AS ' || _stmt;
         GET DIAGNOSTICS _row_num = ROW_COUNT;
 
-        FOR _rec IN SELECT row_to_json(t)::TEXT AS line FROM pg_temp._tpcds_exec_tmp t LOOP
+        FOR _rec IN SELECT row_to_json(t)::TEXT AS line FROM _tpcds_exec_tmp t LOOP
             RETURN NEXT _rec.line;
         END LOOP;
-        EXECUTE 'DROP TABLE pg_temp._tpcds_exec_tmp';
+        EXECUTE 'DROP TABLE _tpcds_exec_tmp';
 
         RETURN NEXT format('-- (%s rows)', _row_num);
     END LOOP;
@@ -2437,16 +2440,12 @@ DECLARE
     _scale_factor INTEGER;
     _storage_type TEXT;
     _saved_path TEXT;
-    _timer_file TEXT;
-    _my_pid INTEGER;
     _optimizer_label TEXT;
     _saved_optimizer TEXT;
 BEGIN
     _bench_start := now();
     _saved_path := current_setting('search_path');
     PERFORM set_config('search_path', 'tpcds, public', false);
-    _my_pid := pg_backend_pid();
-    _timer_file := format('/tmp/.tpcds_timer_%s', _my_pid);
 
     -- Resolve from config if NULL
     IF optimizer IS NULL THEN
@@ -2503,14 +2502,9 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- Start background cancel timer for per-query timeout
+        -- Set per-query timeout via statement_timeout GUC
         IF timeout_sec IS NOT NULL THEN
-            BEGIN
-                EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
-                    format('bash -c ''(sleep %s && psql -qAtc "SELECT pg_cancel_backend(%s)") & echo $! > %s''',
-                           timeout_sec, _my_pid, _timer_file));
-            EXCEPTION WHEN OTHERS THEN NULL;
-            END;
+            PERFORM set_config('statement_timeout', (timeout_sec * 1000)::TEXT, false);
         END IF;
 
         _sql := btrim(_sql, E' \t\n\r');
@@ -2556,14 +2550,9 @@ BEGIN
             END;
         END LOOP;
 
-        -- Kill the background cancel timer
+        -- Reset statement_timeout after each query
         IF timeout_sec IS NOT NULL THEN
-            BEGIN
-                EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
-                    format('kill $(cat %s 2>/dev/null) 2>/dev/null; rm -f %s',
-                           _timer_file, _timer_file));
-            EXCEPTION WHEN OTHERS THEN NULL;
-            END;
+            PERFORM set_config('statement_timeout', '0', false);
         END IF;
 
         INSERT INTO tpcds.bench_results (query_id, status, duration_ms, rows_returned, optimizer, scale_factor, storage_type)
