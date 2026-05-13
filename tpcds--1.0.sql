@@ -410,6 +410,9 @@ BEGIN
     SELECT 'workers',
            COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'workers'), ''), '(not set)')
     UNION ALL
+    SELECT 'dist_mode',
+           COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'dist_mode'), ''), 'smart')
+    UNION ALL
     SELECT 'optimizer',
            COALESCE(NULLIF((SELECT c.value FROM tpcds.config c WHERE c.key = 'optimizer'), ''), '(inherit)')
     UNION ALL
@@ -423,6 +426,31 @@ BEGIN
            (SELECT string_agg(DISTINCT hostname, ', ' ORDER BY hostname)
             FROM gp_segment_configuration WHERE content >= 0 AND role = 'p');
 END;
+$func$;
+
+-- =============================================================================
+-- dist_info() — show distribution policy for all TPC-DS tables
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpcds.dist_info()
+RETURNS TABLE(table_name TEXT, distribution TEXT)
+LANGUAGE sql
+AS $func$
+    SELECT c.relname::TEXT,
+           CASE WHEN p.policytype = 'r' THEN 'REPLICATED'
+                WHEN p.distkey = '' THEN 'RANDOM'
+                ELSE 'HASH(' || array_to_string(ARRAY(
+                    SELECT a.attname FROM unnest(p.distkey) dk(k)
+                    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = dk.k
+                ), ',') || ')'
+           END
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'tpcds'
+    JOIN gp_distribution_policy p ON p.localoid = c.oid
+    WHERE c.relkind = 'r'
+      AND c.relname NOT IN ('config', 'query', 'bench_results', 'bench_summary')
+    ORDER BY
+        CASE WHEN p.policytype = 'r' THEN 0 ELSE 1 END,
+        c.relname;
 $func$;
 
 -- =============================================================================
