@@ -454,6 +454,41 @@ AS $func$
 $func$;
 
 -- =============================================================================
+-- set_parallel_workers(n) — set parallel_workers on all TPC-DS data tables
+--   Enables parallel scan on every table including replicated ones.
+--   Default: 2 workers.  Use 0 to disable.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpcds.set_parallel_workers(p_workers INTEGER DEFAULT 2)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    _tables TEXT[] := ARRAY[
+        'call_center','catalog_page','catalog_returns','catalog_sales',
+        'customer','customer_address','customer_demographics','date_dim',
+        'dbgen_version','household_demographics','income_band','inventory',
+        'item','promotion','reason','ship_mode','store','store_returns',
+        'store_sales','time_dim','warehouse','web_page','web_returns',
+        'web_sales','web_site'
+    ];
+    _t TEXT;
+    _cnt INTEGER := 0;
+BEGIN
+    FOREACH _t IN ARRAY _tables LOOP
+        IF to_regclass('tpcds.' || _t) IS NOT NULL THEN
+            IF p_workers > 0 THEN
+                EXECUTE format('ALTER TABLE tpcds.%I SET (parallel_workers = %s)', _t, p_workers);
+            ELSE
+                EXECUTE format('ALTER TABLE tpcds.%I RESET (parallel_workers)', _t);
+            END IF;
+            _cnt := _cnt + 1;
+        END IF;
+    END LOOP;
+    RETURN format('Set parallel_workers=%s on %s tables', p_workers, _cnt);
+END;
+$func$;
+
+-- =============================================================================
 -- check() — pre-benchmark cluster & OS health checks
 -- =============================================================================
 CREATE OR REPLACE FUNCTION tpcds.check()
@@ -1553,6 +1588,9 @@ CREATE TABLE tpcds.store_sales (
     ss_net_profit             decimal(7,2)
 )$col$ || _with_clause || tpcds._get_dist('store_sales', 'ss_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
+
+    -- Set parallel_workers=2 on all tables by default
+    PERFORM tpcds.set_parallel_workers(2);
 
     RETURN format('Created 25 TPC-DS tables in tpcds schema (storage=%s, partition=%s)',
                   _storage_type, _use_partition);
