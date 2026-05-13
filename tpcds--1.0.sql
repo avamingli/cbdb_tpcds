@@ -35,7 +35,7 @@ INSERT INTO tpcds.config (key, value) VALUES
 CREATE TABLE tpcds.query (
     query_id   INTEGER,
     query_text TEXT NOT NULL
-) DISTRIBUTED REPLICATED;
+) DISTRIBUTED BY (query_id);
 
 -- =============================================================================
 -- Benchmark results table (historical, appended each run)
@@ -49,7 +49,7 @@ CREATE TABLE tpcds.bench_results (
     optimizer     TEXT,
     scale_factor  INTEGER,
     storage_type  TEXT
-) DISTRIBUTED REPLICATED;
+) DISTRIBUTED BY (query_id);
 
 -- =============================================================================
 -- Benchmark summary table (latest run only, updated each bench())
@@ -63,7 +63,7 @@ CREATE TABLE tpcds.bench_summary (
     scale_factor  INTEGER,
     storage_type  TEXT,
     run_ts        TIMESTAMPTZ NOT NULL DEFAULT now()
-) DISTRIBUTED REPLICATED;
+) DISTRIBUTED BY (query_id);
 
 -- =============================================================================
 -- _get_config(key) — read config value, raise if not set
@@ -733,9 +733,58 @@ $func$;
 --   storage_type: 'heap' (default), 'ao', 'aocs'
 --   Respects use_partition config for fact table partitioning
 -- =============================================================================
+-- =============================================================================
+-- _get_dist(table, hash_key, smart_replicate, dist_mode)
+--   Resolve distribution clause for a table.
+--   Priority: per-table config('dist.<table>') → dist_mode default.
+--   Per-table config value: 'replicated' or a column name (e.g. 'd_date_sk').
+--
+--   hash_key:         column name for hash distribution (always required)
+--   smart_replicate:  if true, replicate in 'smart' mode; hash in 'hash' mode
+--   dist_mode:        'smart' or 'hash'
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpcds._get_dist(
+    _table TEXT,
+    _hash_key TEXT,
+    _smart_replicate BOOLEAN,
+    _dist_mode TEXT
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    _override TEXT;
+BEGIN
+    -- Check per-table config override (highest priority)
+    SELECT NULLIF(trim(value), '') INTO _override
+    FROM tpcds.config WHERE key = 'dist.' || _table;
+
+    IF _override IS NOT NULL THEN
+        IF lower(_override) = 'replicated' THEN
+            RETURN ' DISTRIBUTED REPLICATED';
+        ELSE
+            RETURN ' DISTRIBUTED BY (' || _override || ')';
+        END IF;
+    END IF;
+
+    -- No override; apply dist_mode policy
+    IF _dist_mode = 'hash' THEN
+        RETURN ' DISTRIBUTED BY (' || _hash_key || ')';
+    END IF;
+
+    -- 'smart' mode
+    IF _smart_replicate THEN
+        RETURN ' DISTRIBUTED REPLICATED';
+    ELSE
+        RETURN ' DISTRIBUTED BY (' || _hash_key || ')';
+    END IF;
+END;
+$func$;
+
 CREATE OR REPLACE FUNCTION tpcds.gen_schema(
     p_storage_type TEXT DEFAULT NULL,
-    p_use_partition BOOLEAN DEFAULT NULL
+    p_use_partition BOOLEAN DEFAULT NULL,
+    p_dist_mode TEXT DEFAULT NULL
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -753,6 +802,7 @@ DECLARE
     _storage_type TEXT;
     _with_clause TEXT := '';
     _use_partition BOOLEAN;
+    _dist_mode TEXT;
     _dist TEXT;
     _part TEXT;
     _ddl TEXT;
@@ -789,6 +839,23 @@ BEGIN
     END IF;
     PERFORM tpcds.config('use_partition', _use_partition::TEXT);
 
+    -- Resolve dist_mode: param → config → 'smart'
+    --   'smart' (default): 8 tiny lookup tables replicated, rest hash-distributed.
+    --                       Matches TPC-DS v3 reference distribution policy.
+    --   'hash':  All tables hash-distributed, no replicated tables.
+    -- Per-table override: config('dist.<table>', '<col_or_replicated>')
+    --   always takes priority over dist_mode.
+    IF p_dist_mode IS NOT NULL THEN
+        _dist_mode := lower(p_dist_mode);
+    ELSE
+        SELECT NULLIF(value, '') INTO _dist_mode FROM tpcds.config WHERE key = 'dist_mode';
+        _dist_mode := lower(coalesce(_dist_mode, 'smart'));
+    END IF;
+    IF _dist_mode NOT IN ('smart', 'hash') THEN
+        RAISE EXCEPTION 'Invalid dist_mode "%". Use smart or hash.', _dist_mode;
+    END IF;
+    PERFORM tpcds.config('dist_mode', _dist_mode);
+
     SET LOCAL client_min_messages = warning;
     FOREACH _tbl IN ARRAY _tables LOOP
         EXECUTE format('DROP TABLE IF EXISTS tpcds.%I CASCADE', _tbl);
@@ -804,7 +871,7 @@ CREATE TABLE tpcds.dbgen_version (
     dv_create_date            date,
     dv_create_time            time,
     dv_cmdline_args           varchar(200)
-) DISTRIBUTED REPLICATED
+) DISTRIBUTED RANDOMLY
     $ddl$;
 
     -- =========================================================================
@@ -825,11 +892,11 @@ CREATE TABLE tpcds.customer_address (
     ca_country                varchar(20),
     ca_gmt_offset             decimal(5,2),
     ca_location_type          char(20)
-)$col$ || _with_clause || ' DISTRIBUTED BY (ca_address_sk)';
+)$col$ || _with_clause || tpcds._get_dist('customer_address', 'ca_address_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- customer_demographics — DISTRIBUTED REPLICATED
+    -- customer_demographics — DISTRIBUTED BY (cd_demo_sk)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.customer_demographics (
@@ -842,11 +909,11 @@ CREATE TABLE tpcds.customer_demographics (
     cd_dep_count              integer,
     cd_dep_employed_count     integer,
     cd_dep_college_count      integer
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('customer_demographics', 'cd_demo_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- date_dim — DISTRIBUTED REPLICATED
+    -- date_dim — DISTRIBUTED BY (d_date_sk)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.date_dim (
@@ -878,11 +945,11 @@ CREATE TABLE tpcds.date_dim (
     d_current_month           char(1),
     d_current_quarter         char(1),
     d_current_year            char(1)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('date_dim', 'd_date_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- warehouse — DISTRIBUTED REPLICATED
+    -- warehouse — DISTRIBUTED REPLICATED (smart) / BY w_warehouse_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.warehouse (
@@ -900,11 +967,11 @@ CREATE TABLE tpcds.warehouse (
     w_zip                     char(10),
     w_country                 varchar(20),
     w_gmt_offset              decimal(5,2)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('warehouse', 'w_warehouse_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- ship_mode — DISTRIBUTED REPLICATED
+    -- ship_mode — DISTRIBUTED REPLICATED (smart) / BY sm_ship_mode_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.ship_mode (
@@ -914,11 +981,11 @@ CREATE TABLE tpcds.ship_mode (
     sm_code                   char(10),
     sm_carrier                char(20),
     sm_contract               char(20)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('ship_mode', 'sm_ship_mode_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- time_dim — DISTRIBUTED REPLICATED
+    -- time_dim — DISTRIBUTED BY (t_time_sk)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.time_dim (
@@ -932,33 +999,33 @@ CREATE TABLE tpcds.time_dim (
     t_shift                   char(20),
     t_sub_shift               char(20),
     t_meal_time               char(20)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('time_dim', 't_time_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- reason — DISTRIBUTED REPLICATED
+    -- reason — DISTRIBUTED REPLICATED (smart) / BY r_reason_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.reason (
     r_reason_sk               integer               not null,
     r_reason_id               char(16)              not null,
     r_reason_desc             char(100)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('reason', 'r_reason_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- income_band — DISTRIBUTED REPLICATED
+    -- income_band — DISTRIBUTED REPLICATED (smart) / BY ib_income_band_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.income_band (
     ib_income_band_sk         integer               not null,
     ib_lower_bound            integer,
     ib_upper_bound            integer
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('income_band', 'ib_income_band_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- item — DISTRIBUTED REPLICATED
+    -- item — DISTRIBUTED BY (i_item_sk)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.item (
@@ -984,11 +1051,11 @@ CREATE TABLE tpcds.item (
     i_container               char(10),
     i_manager_id              integer,
     i_product_name            char(50)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('item', 'i_item_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- store — DISTRIBUTED REPLICATED
+    -- store — DISTRIBUTED REPLICATED (smart) / BY s_store_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.store (
@@ -1021,11 +1088,11 @@ CREATE TABLE tpcds.store (
     s_country                 varchar(20),
     s_gmt_offset              decimal(5,2),
     s_tax_precentage          decimal(5,2)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('store', 's_store_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- call_center — DISTRIBUTED REPLICATED
+    -- call_center — DISTRIBUTED REPLICATED (smart) / BY cc_call_center_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.call_center (
@@ -1060,7 +1127,7 @@ CREATE TABLE tpcds.call_center (
     cc_country                varchar(20),
     cc_gmt_offset             decimal(5,2),
     cc_tax_percentage         decimal(5,2)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('call_center', 'cc_call_center_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1086,11 +1153,11 @@ CREATE TABLE tpcds.customer (
     c_login                   char(13),
     c_email_address           char(50),
     c_last_review_date        char(10)
-)$col$ || _with_clause || ' DISTRIBUTED BY (c_customer_sk)';
+)$col$ || _with_clause || tpcds._get_dist('customer', 'c_customer_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- web_site — DISTRIBUTED REPLICATED
+    -- web_site — DISTRIBUTED REPLICATED (smart) / BY web_site_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.web_site (
@@ -1120,7 +1187,7 @@ CREATE TABLE tpcds.web_site (
     web_country               varchar(20),
     web_gmt_offset            decimal(5,2),
     web_tax_percentage        decimal(5,2)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('web_site', 'web_site_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1153,11 +1220,11 @@ CREATE TABLE tpcds.store_returns (
     sr_reversed_charge        decimal(7,2),
     sr_store_credit           decimal(7,2),
     sr_net_loss               decimal(7,2)
-)$col$ || _with_clause || ' DISTRIBUTED BY (sr_item_sk)' || _part;
+)$col$ || _with_clause || tpcds._get_dist('store_returns', 'sr_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- household_demographics — DISTRIBUTED REPLICATED
+    -- household_demographics — DISTRIBUTED BY (hd_demo_sk)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.household_demographics (
@@ -1166,11 +1233,11 @@ CREATE TABLE tpcds.household_demographics (
     hd_buy_potential          char(15),
     hd_dep_count              integer,
     hd_vehicle_count          integer
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('household_demographics', 'hd_demo_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- web_page — DISTRIBUTED REPLICATED
+    -- web_page — DISTRIBUTED REPLICATED (smart) / BY wp_web_page_sk (hash)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.web_page (
@@ -1188,11 +1255,11 @@ CREATE TABLE tpcds.web_page (
     wp_link_count             integer,
     wp_image_count            integer,
     wp_max_ad_count           integer
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('web_page', 'wp_web_page_sk', true, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- promotion — DISTRIBUTED REPLICATED
+    -- promotion — DISTRIBUTED BY (p_promo_sk)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.promotion (
@@ -1215,11 +1282,11 @@ CREATE TABLE tpcds.promotion (
     p_channel_details         varchar(100),
     p_purpose                 char(15),
     p_discount_active         char(1)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('promotion', 'p_promo_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
-    -- catalog_page — DISTRIBUTED REPLICATED
+    -- catalog_page — DISTRIBUTED BY (cp_catalog_page_sk)
     -- =========================================================================
     _ddl := $col$
 CREATE TABLE tpcds.catalog_page (
@@ -1232,7 +1299,7 @@ CREATE TABLE tpcds.catalog_page (
     cp_catalog_page_number    integer,
     cp_description            varchar(100),
     cp_type                   varchar(100)
-)$col$ || _with_clause || ' DISTRIBUTED REPLICATED';
+)$col$ || _with_clause || tpcds._get_dist('catalog_page', 'cp_catalog_page_sk', false, _dist_mode);
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1249,7 +1316,7 @@ CREATE TABLE tpcds.inventory (
     inv_item_sk               integer               not null,
     inv_warehouse_sk          integer               not null,
     inv_quantity_on_hand      integer
-)$col$ || _with_clause || ' DISTRIBUTED BY (inv_item_sk)' || _part;
+)$col$ || _with_clause || tpcds._get_dist('inventory', 'inv_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1289,7 +1356,7 @@ CREATE TABLE tpcds.catalog_returns (
     cr_reversed_charge        decimal(7,2),
     cr_store_credit           decimal(7,2),
     cr_net_loss               decimal(7,2)
-)$col$ || _with_clause || ' DISTRIBUTED BY (cr_item_sk)' || _part;
+)$col$ || _with_clause || tpcds._get_dist('catalog_returns', 'cr_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1326,7 +1393,7 @@ CREATE TABLE tpcds.web_returns (
     wr_reversed_charge        decimal(7,2),
     wr_account_credit         decimal(7,2),
     wr_net_loss               decimal(7,2)
-)$col$ || _with_clause || ' DISTRIBUTED BY (wr_item_sk)' || _part;
+)$col$ || _with_clause || tpcds._get_dist('web_returns', 'wr_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1373,7 +1440,7 @@ CREATE TABLE tpcds.web_sales (
     ws_net_paid_inc_ship      decimal(7,2),
     ws_net_paid_inc_ship_tax  decimal(7,2),
     ws_net_profit             decimal(7,2)
-)$col$ || _with_clause || ' DISTRIBUTED BY (ws_item_sk)' || _part;
+)$col$ || _with_clause || tpcds._get_dist('web_sales', 'ws_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1420,7 +1487,7 @@ CREATE TABLE tpcds.catalog_sales (
     cs_net_paid_inc_ship      decimal(7,2),
     cs_net_paid_inc_ship_tax  decimal(7,2),
     cs_net_profit             decimal(7,2)
-)$col$ || _with_clause || ' DISTRIBUTED BY (cs_item_sk)' || _part;
+)$col$ || _with_clause || tpcds._get_dist('catalog_sales', 'cs_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     -- =========================================================================
@@ -1456,7 +1523,7 @@ CREATE TABLE tpcds.store_sales (
     ss_net_paid               decimal(7,2),
     ss_net_paid_inc_tax       decimal(7,2),
     ss_net_profit             decimal(7,2)
-)$col$ || _with_clause || ' DISTRIBUTED BY (ss_item_sk)' || _part;
+)$col$ || _with_clause || tpcds._get_dist('store_sales', 'ss_item_sk', false, _dist_mode) || _part;
     EXECUTE _ddl;
 
     RETURN format('Created 25 TPC-DS tables in tpcds schema (storage=%s, partition=%s)',
